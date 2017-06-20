@@ -1,6 +1,6 @@
-#!/bin/bash
+:q#!/bin/bash
 ##############################################################################
-# Copyright (c) 2015 Ericsson AB, Huawei Technologies Co.,Ltd and others.
+# Copyright (c) 2017 Huawei Technologies Co.,Ltd and others.
 #
 # All rights reserved. This program and the accompanying materials
 # are made available under the terms of the Apache License, Version 2.0
@@ -8,270 +8,84 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 ##############################################################################
 
-# Set up the environment to run yardstick test suites.
+# fit for arm64
+DOCKER_ARCH="$(uname -m)"
 
-set -e
+UBUNTU_PORTS_URL="http://ports.ubuntu.com/ubuntu-ports"
+UBUNTU_ARCHIVE_URL="http://archive.ubuntu.com/ubuntu/"
 
-YARD_IMG_ARCH=amd64
-export YARD_IMG_ARCH
+source_file=/etc/apt/sources.list
 
-if ! grep -q "Defaults env_keep += \"YARD_IMG_ARCH\"" "/etc/sudoers"; then
-    echo "Defaults env_keep += \"YARD_IMG_ARCH YARDSTICK_REPO_DIR\"" | sudo tee -a /etc/sudoers
+if [[ "${DOCKER_ARCH}" == "aarch64" ]]; then
+    sed -i -e 's/^deb \([^/[]\)/deb [arch=arm64] \1/g' "${source_file}"
+    DOCKER_ARCH="arm64"
+    DOCKER_REPO="${UBUNTU_PORTS_URL}"
+    EXTRA_ARCH="amd64"
+    EXTRA_REPO="${UBUNTU_ARCHIVE_URL}"
+    dpkg --add-architecture arm64
+else
+    sed -i -e 's/^deb \([^/[]\)/deb [arch=amd64] \1/g' "${source_file}"
+    DOCKER_ARCH="amd64"
+    DOCKER_REPO="${UBUNTU_ARCHIVE_URL}"
+    EXTRA_ARCH="arm64"
+    EXTRA_REPO="${UBUNTU_PORTS_URL}"
 fi
 
-# Look for a compute node, that is online, and check if it is aarch64
-ARCH_SCRIPT="ssh \$(fuel2 node list | awk -F'|' '\$6 ~ /compute/ && \$11 ~ /rue/ {print \$7; exit;}') uname -m 2>/dev/null | grep -q aarch64"
-if [ "$INSTALLER_TYPE" == "fuel" ]; then
-    sshpass -p r00tme ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -l root "${INSTALLER_IP}" "${ARCH_SCRIPT}" && YARD_IMG_ARCH=arm64
+sed -i -e 's/^deb-src /# deb-src /g' "${source_file}"
+echo "APT::Default-Release \"trusty\";" > /etc/apt/apt.conf.d/default-distro
+
+sub_source_file=/etc/apt/sources.list.d/yardstick.list
+touch "${sub_source_file}"
+
+# first add xenial repo needed for installing qemu_static_user/xenial in the container
+# then add complementary architecture repositories in case the cloud image is of different arch
+echo -e "deb [arch="${DOCKER_ARCH}"] "${DOCKER_REPO}" xenial-updates universe
+deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty main universe multiverse restricted
+deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-updates main universe multiverse restricted
+deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-security main universe multiverse restricted
+deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-proposed main universe multiverse restricted" > "${sub_source_file}"
+
+echo "vm.mmap_min_addr = 0" > /etc/sysctl.d/mmap_min_addr.conf
+
+# install tools
+apt-get update && apt-get install -y \
+    qemu-user-static/xenial \
+    wget \
+    expect \
+    curl \
+    git \
+    sshpass \
+    qemu-utils \
+    kpartx \
+    libffi-dev \
+    libssl-dev \
+    libzmq-dev \
+    python \
+    python-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    nginx \
+    uwsgi \
+    uwsgi-plugin-python \
+    supervisor \
+    python-pip \
+    vim
+
+if [[ "${DOCKER_ARCH}" != "aarch64" ]]; then
+    apt-get install -y libc6:arm64
 fi
 
-HW_FW_TYPE=""
-if [ "${YARD_IMG_ARCH}" == "arm64" ]; then
-    HW_FW_TYPE=uefi
-fi
-export HW_FW_TYPE
+apt-get -y autoremove && apt-get clean
 
-UCA_HOST="cloud-images.ubuntu.com"
-if [ "${YARD_IMG_ARCH}" == "arm64" ]; then
-    export CLOUD_IMG_URL="http://${UCA_HOST}/${release}/current/${release}-server-cloudimg-${YARD_IMG_ARCH}.tar.gz"
-    if ! grep -q "Defaults env_keep += \"CLOUD_IMG_URL\"" "/etc/sudoers"; then
-        echo "Defaults env_keep += \"CLOUD_IMG_URL\"" | sudo tee -a /etc/sudoers
-    fi
-fi
+git config --global http.sslVerify false
 
-build_yardstick_image()
-{
-    echo
-    echo "========== Build yardstick cloud image =========="
 
-    if [[ "$DEPLOY_SCENARIO" == *"-lxd-"* ]]; then
-        if [ ! -f "${RAW_IMAGE}" ];then
-            local cmd
-            cmd="sudo $(which yardstick-img-lxd-modify) $(pwd)/tools/ubuntu-server-cloudimg-modify.sh"
+# install yardstick + dependencies
+easy_install -U pip
+pip install -r requirements.txt
+pip install -e .
 
-            # Build the image. Retry once if the build fails
-            $cmd || $cmd
+/bin/bash "$(pwd)/api/api-prepare.sh"
 
-            if [ ! -f "${RAW_IMAGE}" ]; then
-                echo "Failed building RAW image"
-                exit 1
-            fi
-        fi
-    else
-        if [ ! -f "${QCOW_IMAGE}" ];then
-            local cmd
-            cmd="sudo $(which yardstick-img-modify) $(pwd)/tools/ubuntu-server-cloudimg-modify.sh"
-
-            # Build the image. Retry once if the build fails
-            $cmd || $cmd
-
-            if [ ! -f "${QCOW_IMAGE}" ]; then
-                echo "Failed building QCOW image"
-                exit 1
-            fi
-        fi
-    fi
-}
-
-load_yardstick_image()
-{
-    echo
-    echo "========== Loading yardstick cloud image =========="
-    EXTRA_PARAMS=""
-    if [[ "${YARD_IMG_ARCH}" == "arm64" && "${YARD_IMG_AKI}" == "true" ]]; then
-        CLOUD_IMAGE="/tmp/${release}-server-cloudimg-${YARD_IMG_ARCH}.tar.gz"
-        CLOUD_KERNEL="/tmp/${release}-server-cloudimg-${YARD_IMG_ARCH}-vmlinuz-generic"
-        cd /tmp
-        if [ ! -f "${CLOUD_IMAGE}" ]; then
-            wget "${CLOUD_IMG_URL}"
-        fi
-        if [ ! -f "${CLOUD_KERNEL}" ]; then
-            tar xf "${CLOUD_IMAGE}" "${CLOUD_KERNEL##**/}"
-        fi
-        create_kernel=$(openstack image create \
-                --public \
-                --disk-format qcow2 \
-                --container-format bare \
-                --file ${CLOUD_KERNEL} \
-                yardstick-${release}-kernel)
-
-        GLANCE_KERNEL_ID=$(echo "$create_kernel" | awk '/ id / {print $(NF-1)}')
-        if [ -z "$GLANCE_KERNEL_ID" ]; then
-            echo 'Failed uploading kernel to cloud'.
-            exit 1
-        fi
-
-        command_line="root=/dev/vdb1 console=tty0 console=ttyS0 console=ttyAMA0 rw"
-
-        EXTRA_PARAMS="--property kernel_id=$GLANCE_KERNEL_ID --property os_command_line=\"$command_line\""
-
-        rm -f -- "${CLOUD_KERNEL}" "${CLOUD_IMAGE}"
-        cd "${YARDSTICK_REPO_DIR}"
-    fi
-
-    # VPP requires guest memory to be backed by large pages
-    if [[ "$DEPLOY_SCENARIO" == *"-fdio-"* ]]; then
-        EXTRA_PARAMS=$EXTRA_PARAMS" --property hw_mem_page_size=large"
-    fi
-
-    if [[ -n "${HW_FW_TYPE}" ]]; then
-        EXTRA_PARAMS=$EXTRA_PARAMS" --property hw_firmware_type=${HW_FW_TYPE}"
-    fi
-
-    if [[ "$DEPLOY_SCENARIO" == *"-lxd-"* ]]; then
-        output=$(eval openstack image create \
-            --public \
-            --disk-format raw \
-            --container-format bare \
-            ${EXTRA_PARAMS} \
-            --file ${RAW_IMAGE} \
-            yardstick-image)
-    else
-        output=$(eval openstack image create \
-            --public \
-            --disk-format qcow2 \
-            --container-format bare \
-            ${EXTRA_PARAMS} \
-            --file ${QCOW_IMAGE} \
-            yardstick-image)
-    fi
-
-    echo "$output"
-
-    GLANCE_IMAGE_ID=$(echo "$output" | grep " id " | awk '{print $(NF-1)}')
-
-    if [ -z "$GLANCE_IMAGE_ID" ]; then
-        echo 'Failed uploading image to cloud'.
-        exit 1
-    fi
-
-    echo "Glance image id: $GLANCE_IMAGE_ID"
-}
-
-load_cirros_image()
-{
-    if [[ "${YARD_IMG_ARCH}" == "arm64" ]]; then
-        CIRROS_IMAGE_VERSION="cirros-d161201"
-        CIRROS_IMAGE_PATH="/home/opnfv/images/cirros-d161201-aarch64-disk.img"
-    else
-        CIRROS_IMAGE_VERSION="Cirros-0.3.5"
-        CIRROS_IMAGE_PATH="/home/opnfv/images/cirros-0.3.5-x86_64-disk.img"
-    fi
-
-    if [[ -n $(openstack image list | grep -e "${CIRROS_IMAGE_VERSION}") ]]; then
-        echo "${CIRROS_IMAGE_VERSION} image already exist, skip loading cirros image"
-    else
-        echo
-        echo "========== Loading cirros cloud image =========="
-
-        local image_file="${CIRROS_IMAGE_PATH}"
-
-        EXTRA_PARAMS=""
-        # VPP requires guest memory to be backed by large pages
-        if [[ "$DEPLOY_SCENARIO" == *"-fdio-"* ]]; then
-            EXTRA_PARAMS=$EXTRA_PARAMS" --property hw_mem_page_size=large"
-        fi
-
-        output=$(openstack image create \
-            --disk-format qcow2 \
-            --container-format bare \
-            ${EXTRA_PARAMS} \
-            --file ${image_file} \
-            cirros-0.3.5)
-        echo "$output"
-
-        CIRROS_IMAGE_ID=$(echo "$output" | grep " id " | awk '{print $(NF-1)}')
-        if [ -z "$CIRROS_IMAGE_ID" ]; then
-            echo 'Failed uploading cirros image to cloud'.
-            exit 1
-        fi
-
-        echo "Cirros image id: $CIRROS_IMAGE_ID"
-    fi
-}
-
-load_ubuntu_image()
-{
-    echo
-    echo "========== Loading ubuntu cloud image =========="
-
-    local ubuntu_image_file=/home/opnfv/images/xenial-server-cloudimg-amd64-disk1.img
-
-    EXTRA_PARAMS=""
-    # VPP requires guest memory to be backed by large pages
-    if [[ "$DEPLOY_SCENARIO" == *"-fdio-"* ]]; then
-        EXTRA_PARAMS=$EXTRA_PARAMS" --property hw_mem_page_size=large"
-    fi
-
-    output=$(openstack image create \
-        --disk-format qcow2 \
-        --container-format bare \
-        $EXTRA_PARAMS \
-        --file $ubuntu_image_file \
-        Ubuntu-16.04)
-    echo "$output"
-
-    UBUNTU_IMAGE_ID=$(echo "$output" | grep " id " | awk '{print $(NF-1)}')
-
-    if [ -z "$UBUNTU_IMAGE_ID" ]; then
-        echo 'Failed uploading UBUNTU image to cloud'.
-        exit 1
-    fi
-
-    echo "Ubuntu image id: $UBUNTU_IMAGE_ID"
-}
-
-create_nova_flavor()
-{
-    if ! openstack flavor list | grep -q yardstick-flavor; then
-        echo
-        echo "========== Creating yardstick-flavor =========="
-        # Create the nova flavor used by some sample test cases
-        openstack flavor create --id 100 --ram 512 --disk 3 --vcpus 1 yardstick-flavor
-        # DPDK-enabled OVS requires guest memory to be backed by large pages
-        if [[ $DEPLOY_SCENARIO == *[_-]ovs[_-]* ]]; then
-            openstack flavor set --property hw:mem_page_size=large yardstick-flavor
-        fi
-        # VPP requires guest memory to be backed by large pages
-        if [[ "$DEPLOY_SCENARIO" == *"-fdio-"* ]]; then
-            openstack flavor set --property hw:mem_page_size=large yardstick-flavor
-        fi
-    fi
-
-    if ! openstack flavor list | grep -q storperf; then
-        echo
-        echo "========== Creating storperf flavor =========="
-        # Create the nova flavor used by storperf test case
-        openstack flavor create --id auto --ram 8192 --disk 4 --vcpus 2 storperf
-    fi
-}
-
-main()
-{
-    QCOW_IMAGE="/tmp/workspace/yardstick/yardstick-image.img"
-    RAW_IMAGE="/tmp/workspace/yardstick/yardstick-image.tar.gz"
-
-    if [ -f /home/opnfv/images/yardstick-image.img ];then
-        QCOW_IMAGE='/home/opnfv/images/yardstick-image.img'
-    fi
-    if [ -f /home/opnfv/images/yardstick-image.tar.gz ];then
-        RAW_IMAGE='/home/opnfv/images/yardstick-image.tar.gz'
-    fi
-
-    build_yardstick_image
-    load_yardstick_image
-    if [ "${YARD_IMG_ARCH}" == "arm64" ]; then
-        sed -i 's/image: {{image}}/image: TestVM/g' tests/opnfv/test_cases/opnfv_yardstick_tc002.yaml
-        sed -i 's/image: cirros-0.3.5/image: TestVM/g' samples/ping.yaml
-        #We have overlapping IP with the real network
-        for filename in tests/opnfv/test_cases/*; do
-            sed -i "s/cidr: '10.0.1.0\/24'/cidr: '10.3.1.0\/24'/g" "${filename}"
-        done
-    else
-        load_cirros_image
-        load_ubuntu_image
-    fi
-    create_nova_flavor
-}
-
-main
+service nginx restart
+uwsgi -i /etc/yardstick/yardstick.ini
