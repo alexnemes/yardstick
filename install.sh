@@ -28,6 +28,7 @@ else
     DOCKER_REPO="${UBUNTU_ARCHIVE_URL}"
     EXTRA_ARCH="arm64"
     EXTRA_REPO="${UBUNTU_PORTS_URL}"
+    dpkg --add-architecture arm64
 fi
 
 sed -i -e 's/^deb-src /# deb-src /g' "${source_file}"
@@ -43,7 +44,7 @@ deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty main universe multiverse restr
 deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-updates main universe multiverse restricted
 deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-security main universe multiverse restricted
 deb [arch="${EXTRA_ARCH}"] "${EXTRA_REPO}" trusty-proposed main universe multiverse restricted" > "${sub_source_file}"
-dpkg --add-architecture arm64
+
 echo "vm.mmap_min_addr = 0" > /etc/sysctl.d/mmap_min_addr.conf
 
 # install tools
