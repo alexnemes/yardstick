@@ -1,4 +1,4 @@
-:q#!/bin/bash
+#!/bin/bash
 ##############################################################################
 # Copyright (c) 2017 Huawei Technologies Co.,Ltd and others.
 #
